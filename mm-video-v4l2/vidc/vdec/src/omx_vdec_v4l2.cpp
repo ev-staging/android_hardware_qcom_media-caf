@@ -634,6 +634,7 @@ omx_vdec::omx_vdec(): m_error_propogated(false),
     allocate_native_handle(false),
     m_other_extradata(NULL),
     m_profile(0),
+    m_need_turbo(0),
     client_set_fps(false),
     stereo_output_mode(HAL_NO_3D),
     m_last_rendered_TS(-1),
@@ -1612,6 +1613,7 @@ void omx_vdec::process_event_cb(void *ctxt, unsigned char id)
                                         if (p2 == OMX_IndexParamPortDefinition) {
                                             DEBUG_PRINT_HIGH("Rxd PORT_RECONFIG: OMX_IndexParamPortDefinition");
                                             pThis->in_reconfig = true;
+                                            pThis->m_need_turbo &= ~TURBO_MODE_HIGH_FPS;
                                         }  else if (p2 == OMX_IndexConfigCommonOutputCrop) {
                                             DEBUG_PRINT_HIGH("Rxd PORT_RECONFIG: OMX_IndexConfigCommonOutputCrop");
 
@@ -2160,7 +2162,6 @@ OMX_ERRORTYPE omx_vdec::component_init(OMX_STRING role)
     drv_ctx.frame_rate.fps_numerator = DEFAULT_FPS;
     drv_ctx.frame_rate.fps_denominator = 1;
     operating_frame_rate = DEFAULT_FPS;
-    high_fps = false;
     m_poll_efd = eventfd(0, 0);
     if (m_poll_efd < 0) {
         DEBUG_PRINT_ERROR("Failed to create event fd(%s)", strerror(errno));
@@ -5292,15 +5293,16 @@ OMX_ERRORTYPE  omx_vdec::set_config(OMX_IN OMX_HANDLETYPE      hComp,
         struct v4l2_control control;
 
         DEBUG_PRINT_LOW("Set perf level: %d", perf->ePerfLevel);
-
         control.id = V4L2_CID_MPEG_VIDC_SET_PERF_LEVEL;
 
         switch (perf->ePerfLevel) {
             case OMX_QCOM_PerfLevelNominal:
                 control.value = V4L2_CID_MPEG_VIDC_PERF_LEVEL_NOMINAL;
+                m_need_turbo &= ~TURBO_MODE_CLIENT_REQUESTED;
                 break;
             case OMX_QCOM_PerfLevelTurbo:
                 control.value = V4L2_CID_MPEG_VIDC_PERF_LEVEL_TURBO;
+                m_need_turbo |= TURBO_MODE_CLIENT_REQUESTED;
                 break;
             default:
                 ret = OMX_ErrorUnsupportedSetting;
@@ -5909,6 +5911,12 @@ OMX_ERRORTYPE  omx_vdec::use_input_heap_buffers(
 {
     DEBUG_PRINT_LOW("Inside %s, %p", __FUNCTION__, buffer);
     OMX_ERRORTYPE eRet = OMX_ErrorNone;
+
+    if (secure_mode) {
+        DEBUG_PRINT_ERROR("use_input_heap_buffers is not allowed in secure mode");
+        return OMX_ErrorUndefined;
+    }
+
     if (!m_inp_heap_ptr)
         m_inp_heap_ptr = (OMX_BUFFERHEADERTYPE*)
             calloc( (sizeof(OMX_BUFFERHEADERTYPE)),
@@ -7179,7 +7187,7 @@ OMX_ERRORTYPE  omx_vdec::empty_this_buffer_proxy(OMX_IN OMX_HANDLETYPE  hComp,
     /*for use buffer we need to memcpy the data*/
     temp_buffer->buffer_len = buffer->nFilledLen;
 
-    if (input_use_buffer && temp_buffer->bufferaddr) {
+    if (input_use_buffer && temp_buffer->bufferaddr && !secure_mode) {
         if (buffer->nFilledLen <= temp_buffer->buffer_len) {
             if (arbitrary_bytes) {
                 memcpy (temp_buffer->bufferaddr, (buffer->pBuffer + buffer->nOffset),buffer->nFilledLen);
@@ -8155,47 +8163,6 @@ OMX_ERRORTYPE omx_vdec::fill_buffer_done(OMX_HANDLETYPE hComp,
         }
     }
 
-    if (!output_flush_progress && (buffer->nFilledLen > 0)) {
-        // set the default colorspace advised by client, since the bitstream may be
-        // devoid of colorspace-info.
-        if (m_enable_android_native_buffers) {
-            ColorSpace_t color_space = ITU_R_601;
-
-        // Disabled ?
-        // WA for VP8. Vp8 encoder does not embed color-info (yet!).
-        // Encoding RGBA results in 601-LR for all resolutions.
-        // This conflicts with the client't defaults which are based on resolution.
-        //   Eg: 720p will be encoded as 601-LR. Client will say 709.
-        // Re-enable this code once vp8 encoder generates color-info and hence the
-        // decoder will be able to override with the correct source color.
-#if 0
-            switch (m_client_color_space.sAspects.mPrimaries) {
-                case ColorAspects::PrimariesBT601_6_625:
-                case ColorAspects::PrimariesBT601_6_525:
-                {
-                    color_space = m_client_color_space.sAspects.mRange == ColorAspects::RangeFull ?
-                            ITU_R_601_FR : ITU_R_601;
-                    break;
-                }
-                case ColorAspects::PrimariesBT709_5:
-                {
-                    color_space = ITU_R_709;
-                    break;
-                }
-                default:
-                {
-                    break;
-                }
-            }
-#endif
-            DEBUG_PRINT_LOW("setMetaData for Color Space (client) = 0x%x (601=%u FR=%u 709=%u)",
-                    color_space, ITU_R_601, ITU_R_601_FR, ITU_R_709);
-            set_colorspace_in_handle(color_space, buffer - m_out_mem_ptr);
-        }
-        DEBUG_PRINT_LOW("Processing extradata");
-        handle_extradata(buffer);
-    }
-
 #ifdef OUTPUT_EXTRADATA_LOG
     if (outputExtradataFile) {
         int buf_index = buffer - m_out_mem_ptr;
@@ -8676,6 +8643,45 @@ int omx_vdec::async_message_process (void *context, void* message)
                    }
 
                    if (vdec_msg->msgdata.output_frame.len) {
+                       if (!omx->output_flush_progress && (omxhdr->nFilledLen > 0)) {
+                           // set the default colorspace advised by client, since the bitstream may be
+                           // devoid of colorspace-info.
+                           if (omx->m_enable_android_native_buffers) {
+                               ColorSpace_t color_space = ITU_R_601;
+
+                           // Disabled ?
+                           // WA for VP8. Vp8 encoder does not embed color-info (yet!).
+                           // Encoding RGBA results in 601-LR for all resolutions.
+                           // This conflicts with the client't defaults which are based on resolution.
+                           //   Eg: 720p will be encoded as 601-LR. Client will say 709.
+                           // Re-enable this code once vp8 encoder generates color-info and hence the
+                           // decoder will be able to override with the correct source color.
+#if 0
+                               switch (omx->m_client_color_space.sAspects.mPrimaries) {
+                                   case ColorAspects::PrimariesBT601_6_625:
+                                   case ColorAspects::PrimariesBT601_6_525:
+                                   {
+                                       color_space = omx->m_client_color_space.sAspects.mRange == ColorAspects::RangeFull ?
+                                               ITU_R_601_FR : ITU_R_601;
+                                       break;
+                                   }
+                                   case ColorAspects::PrimariesBT709_5:
+                                   {
+                                       color_space = ITU_R_709;
+                                       break;
+                                   }
+                                   default:
+                                   {
+                                       break;
+                                   }
+                               }
+#endif
+                               DEBUG_PRINT_LOW("setMetaData for Color Space (client) = 0x%x (601=%u FR=%u 709=%u)",
+                                       color_space, ITU_R_601, ITU_R_601_FR, ITU_R_709);
+                               omx->set_colorspace_in_handle(color_space, omxhdr - omx->m_out_mem_ptr);
+                           }
+                       }
+
                        DEBUG_PRINT_LOW("Processing extradata");
                        omx->handle_extradata(omxhdr);
 
@@ -8766,7 +8772,7 @@ int omx_vdec::async_message_process (void *context, void* message)
                    if (omxhdr->nFilledLen)
                        omx->prev_n_filled_len = omxhdr->nFilledLen;
 
-                   if (omxhdr && omxhdr->nFilledLen && !omx->high_fps) {
+                   if (omxhdr && omxhdr->nFilledLen && !omx->m_need_turbo) {
                         omx->request_perf_level(VIDC_NOMINAL);
                    }
                    if (omx->output_use_buffer && omxhdr->pBuffer &&
@@ -8799,7 +8805,7 @@ int omx_vdec::async_message_process (void *context, void* message)
             omx->m_reconfig_height = vdec_msg->msgdata.output_frame.picsize.frame_height;
             omx->post_event (OMX_CORE_OUTPUT_PORT_INDEX, OMX_IndexParamPortDefinition,
                     OMX_COMPONENT_GENERATE_PORT_RECONFIG);
-            if (!omx->high_fps) {
+            if (!omx->m_need_turbo) {
                 omx->request_perf_level(VIDC_NOMINAL);
             }
             break;
@@ -9754,7 +9760,7 @@ OMX_ERRORTYPE omx_vdec::get_buffer_req(vdec_allocatorproperty *buffer_prop)
         if (increase_output && fps_above_180 &&
             output_capability == V4L2_PIX_FMT_H264 &&
             is_res_1080p_or_below) {
-            high_fps = true;
+            m_need_turbo |= TURBO_MODE_HIGH_FPS;
             DEBUG_PRINT_LOW("High fps - fps = %d operating_rate = %d", fps, operating_frame_rate);
             DEBUG_PRINT_LOW("getbufreq[output]: Increase buffer count (%d) to (%d) to support high fps",
                             bufreq.count, bufreq.count + 10);
