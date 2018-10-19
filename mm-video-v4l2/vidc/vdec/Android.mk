@@ -158,6 +158,9 @@ LOCAL_SRC_FILES         += src/hevc_utils.cpp
 LOCAL_STATIC_LIBRARIES  := libOmxVidcCommon
 LOCAL_SRC_FILES         += src/omx_vdec_v4l2.cpp
 
+# Allow implicit fallthrough in omx_vdec_v4l2.cpp:5409 until it is fixed.
+LOCAL_CFLAGS += -Wno-error=implicit-fallthrough
+
 include $(BUILD_SHARED_LIBRARY)
 
 

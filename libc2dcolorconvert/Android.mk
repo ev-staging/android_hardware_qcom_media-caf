@@ -5,6 +5,9 @@ include $(CLEAR_VARS)
 LOCAL_SRC_FILES := \
         C2DColorConverter.cpp
 
+# Allow implicit fallthrough in C2DColorConverter.cpp:554 until it is fixed.
+LOCAL_CFLAGS += -Wno-error=implicit-fallthrough
+
 LOCAL_C_INCLUDES := \
     $(TARGET_OUT_HEADERS)/adreno
 LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/qcom/display
